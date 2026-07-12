@@ -1,19 +1,29 @@
+from collections import defaultdict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI()
 
-connections: dict[str, WebSocket] = {}   # {username: live connection}
+# {username: [connection, connection, ...]}
+# one user can have multiple tabs/devices open
+connections: defaultdict[str, list[WebSocket]] = defaultdict(list)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     await websocket.accept()
-    connections[username] = websocket
+    # add to this user's list
+    connections[username].append(websocket)
 
     try:
         while True:
             data = await websocket.receive_text()
-            for user, conn in connections.items():
-                await conn.send_text(f"{username}: {data}")
+            for user, conns in connections.items():
+                # a user may have many connections
+                for conn in conns:
+                    await conn.send_text(f"{username}: {data}")
     except WebSocketDisconnect:
-        del connections[username]
+        # remove ONLY this connection
+        connections[username].remove(websocket)
+        # list empty -> user fully offline  
+        if not connections[username]:            
+            del connections[username]
