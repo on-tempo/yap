@@ -2,8 +2,42 @@ from collections import defaultdict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from database import engine, SessionLocal
 import models
+import asyncio
+import json
+import os
+import redis.asyncio as redis
 
 app = FastAPI()
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+ROOM_CHANNEL = "yap:rooms"
+
+
+async def redis_listener():
+    """Listen to the room channel and fan out to this instance's connections."""
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe(ROOM_CHANNEL)
+
+    async for event in pubsub.listen():
+        if event["type"] != "message":
+            continue                      # skip subscribe confirmations
+
+        payload = json.loads(event["data"])
+        room_name = payload["room"]
+        sender = payload["sender"]
+        message = payload["content"]
+
+        # deliver only to members that are connected to THIS instance
+        for user in rooms.get(room_name, set()):
+            for conn in connections.get(user, []):
+                await conn.send_text(f"[{room_name}] {sender}: {message}")
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(redis_listener())
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -87,10 +121,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     finally:
                         db.close()
 
-                    # then deliver to everyone currently in the room
-                    for user in rooms[room_name]:
-                        for conn in connections.get(user, []):
-                            await conn.send_text(f"[{room_name}] {username}: {message}")
+                    # publish instead of delivering directly — the listener fans out
+                    await redis_client.publish(ROOM_CHANNEL, json.dumps({
+                        "room": room_name,
+                        "sender": username,
+                        "content": message,
+                    }))
                 else:
                     # user is not in the room or room doesn't exist
                     for conn in connections[username]:
