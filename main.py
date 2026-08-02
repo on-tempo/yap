@@ -25,14 +25,34 @@ async def redis_listener():
             continue                      # skip subscribe confirmations
 
         payload = json.loads(event["data"])
-        room_name = payload["room"]
+
+        msg_type = payload["type"]
         sender = payload["sender"]
         message = payload["content"]
 
-        # deliver only to members that are connected to THIS instance
-        for user in rooms.get(room_name, set()):
-            for conn in connections.get(user, []):
-                await conn.send_text(f"[{room_name}] {sender}: {message}")
+        if msg_type == "room":
+            room_name = payload["room"]
+
+            for user in rooms.get(room_name, set()):
+                for conn in connections.get(user, []):
+                    await conn.send_text(
+                        f"[{room_name}] {sender}: {message}"
+                    )
+
+        elif msg_type == "dm":
+            target = payload["target"]
+
+            # receiver
+            for conn in connections.get(target, []):
+                await conn.send_text(
+                    f"[DM] {sender}: {message}"
+                )
+
+            # sender echo
+            for conn in connections.get(sender, []):
+                await conn.send_text(
+                    f"[DM to {target}] {sender}: {message}"
+                )
 
 
 @app.on_event("startup")
@@ -123,6 +143,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
                     # publish instead of delivering directly — the listener fans out
                     await redis_client.publish(ROOM_CHANNEL, json.dumps({
+                        "type": "room",
                         "room": room_name,
                         "sender": username,
                         "content": message,
@@ -147,18 +168,15 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 target = parts[0][1:]
                 message = parts[1]
 
-                if target in connections:
-                    # send to ALL of the target's connections
-                    for conn in connections[target]:
-                        await conn.send_text(f"[DM] {username}: {message}")
-
-                    # sender also sees their own DM (on all their tabs)
-                    for conn in connections[username]:
-                        await conn.send_text(f"[DM to {target}] {username}: {message}")
-                else:
-                    # target is offline/unknown -> tell ONLY the sender
-                    for conn in connections[username]:
-                        await conn.send_text(f"[system] {target} is not online")
+                await redis_client.publish(
+                    ROOM_CHANNEL,
+                    json.dumps({
+                        "type": "dm",
+                        "target": target,
+                        "sender": username,
+                        "content": message,
+                    }),
+                )
 
             else:
                 # ---- broadcast path ----
