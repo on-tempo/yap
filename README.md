@@ -16,7 +16,7 @@ A single user can connect from multiple browser tabs or devices. Storing only on
 
 `connections` exists only in process memory, so multiple server instances cannot see each other's WebSocket connections. Instead of sending messages directly between servers, each instance publishes events to Redis Pub/Sub and subscribes to the same channel. Every server forwards incoming events only to the clients it currently owns, allowing horizontal scaling without server-to-server communication or code changes when new instances are added.
 
-Room messages and direct messages share a single channel and are distinguished by a `type` field in the payload. Per-room or per-user channels would let each instance subscribe only to what it needs, but they add subscribe and unsubscribe bookkeeping on every join, connect, and disconnect — not worth it at this scale.
+Room messages and direct messages share a single channel and are distinguished by a `type` field in the payload. Per-room or per-user channels would let each instance subscribe only to what it needs, but they add subscribe and unsubscribe bookkeeping on every join, connect, and disconnect.
 
 ### rooms
 
