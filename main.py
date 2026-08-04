@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import redis.asyncio as redis
+import time
 
 app = FastAPI()
 
@@ -15,6 +16,8 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 ROOM_CHANNEL = "yap:rooms"
 PRESENCE_TTL = 30        # seconds before a stale entry expires
 HEARTBEAT_INTERVAL = 10  # refresh well before the TTL runs out
+RATE_LIMIT = 10
+RATE_WINDOW = 10
 
 async def redis_listener():
     """Listen to the room channel and fan out to this instance's connections."""
@@ -66,6 +69,22 @@ async def presence_heartbeat():
             await redis_client.set(f"yap:online:{user}", "1", ex=PRESENCE_TTL)
 
 
+async def is_rate_limited(username: str) -> bool:
+    """Return True if this user has exceeded the message limit.
+
+    INCR is atomic, so concurrent messages from the same user can never
+    read the same counter value
+    """
+    window = int(time.time()) // RATE_WINDOW
+    key = f"yap:rate:{username}:{window}"
+
+    count = await redis_client.incr(key)
+    if count == 1:
+        # first message in this window — make sure the key disappears with it
+        await redis_client.expire(key, RATE_WINDOW)
+
+    return count > RATE_LIMIT
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(redis_listener())
@@ -92,6 +111,11 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     try:
         while True:
             data = await websocket.receive_text()
+
+            if await is_rate_limited(username):
+                for conn in connections[username]:
+                    await conn.send_text("[system] slow down — you are sending too fast")
+                continue
 
             if data.startswith("/read"):
                 # ---- read receipt path ----
