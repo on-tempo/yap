@@ -18,3 +18,10 @@ class RoomRead(Base):
     room = Column(String, nullable=False, index=True)
     username = Column(String, nullable=False, index=True)
     last_read_id = Column(Integer, nullable=False, default=0)
+
+class RoomMember(Base):
+    __tablename__ = "room_members"
+
+    id = Column(Integer, primary_key=True)
+    room = Column(String, nullable=False, index=True)
+    username = Column(String, nullable=False, index=True)

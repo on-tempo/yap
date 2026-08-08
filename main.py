@@ -16,11 +16,80 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 ROOM_CHANNEL = "yap:rooms"
 PRESENCE_TTL = 30        # seconds before a stale entry expires
 HEARTBEAT_INTERVAL = 10  # refresh well before the TTL runs out
-RATE_LIMIT = 10
-RATE_WINDOW = 10
+RATE_LIMIT = 10          # max messages per window
+RATE_WINDOW = 10         # seconds
+
+models.Base.metadata.create_all(bind=engine)
+
+# {username: [connection, connection, ...]}
+# one user can have multiple tabs/devices open
+connections: defaultdict[str, list[WebSocket]] = defaultdict(list)
+
+
+def get_room_members(db, room_name: str) -> set[str]:
+    """All usernames that have joined this room."""
+    rows = (
+        db.query(models.RoomMember.username)
+        .filter(models.RoomMember.room == room_name)
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def is_room_member(db, room_name: str, username: str) -> bool:
+    """Whether this user has joined the room."""
+    return (
+        db.query(models.RoomMember)
+        .filter(
+            models.RoomMember.room == room_name,
+            models.RoomMember.username == username,
+        )
+        .first()
+        is not None
+    )
+
+
+def count_unread(db, room_name: str, username: str) -> int:
+    """Messages in this room newer than the user's last read marker."""
+    record = (
+        db.query(models.RoomRead)
+        .filter(
+            models.RoomRead.room == room_name,
+            models.RoomRead.username == username,
+        )
+        .first()
+    )
+    last_read_id = record.last_read_id if record else 0
+
+    return (
+        db.query(models.Message)
+        .filter(
+            models.Message.room == room_name,
+            models.Message.id > last_read_id,
+        )
+        .count()
+    )
+
+
+async def is_rate_limited(username: str) -> bool:
+    """Return True if this user has exceeded the message limit.
+
+    INCR is atomic, so concurrent messages from the same user can never
+    read the same counter value.
+    """
+    window = int(time.time()) // RATE_WINDOW
+    key = f"yap:rate:{username}:{window}"
+
+    count = await redis_client.incr(key)
+    if count == 1:
+        # first message in this window — make sure the key disappears with it
+        await redis_client.expire(key, RATE_WINDOW)
+
+    return count > RATE_LIMIT
+
 
 async def redis_listener():
-    """Listen to the room channel and fan out to this instance's connections."""
+    """Listen to the shared channel and fan out to this instance's connections."""
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(ROOM_CHANNEL)
 
@@ -37,31 +106,32 @@ async def redis_listener():
         if msg_type == "room":
             room_name = payload["room"]
 
-            for user in rooms.get(room_name, set()):
+            db = SessionLocal()
+            try:
+                members = get_room_members(db, room_name)
+            finally:
+                db.close()
+
+            for user in members:
                 for conn in connections.get(user, []):
-                    await conn.send_text(
-                        f"[{room_name}] {sender}: {message}"
-                    )
+                    await conn.send_text(f"[{room_name}] {sender}: {message}")
 
         elif msg_type == "dm":
             target = payload["target"]
 
             # receiver
             for conn in connections.get(target, []):
-                await conn.send_text(
-                    f"[DM] {sender}: {message}"
-                )
+                await conn.send_text(f"[DM] {sender}: {message}")
 
             # sender echo
             for conn in connections.get(sender, []):
-                await conn.send_text(
-                    f"[DM to {target}] {sender}: {message}"
-                )
+                await conn.send_text(f"[DM to {target}] {sender}: {message}")
+
 
 async def presence_heartbeat():
     """Refresh presence keys for everyone connected to this instance.
 
-    A crashed server stops refreshing, so its entries expire on their own
+    A crashed server stops refreshing, so its entries expire on their own.
     """
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -69,35 +139,10 @@ async def presence_heartbeat():
             await redis_client.set(f"yap:online:{user}", "1", ex=PRESENCE_TTL)
 
 
-async def is_rate_limited(username: str) -> bool:
-    """Return True if this user has exceeded the message limit.
-
-    INCR is atomic, so concurrent messages from the same user can never
-    read the same counter value
-    """
-    window = int(time.time()) // RATE_WINDOW
-    key = f"yap:rate:{username}:{window}"
-
-    count = await redis_client.incr(key)
-    if count == 1:
-        # first message in this window — make sure the key disappears with it
-        await redis_client.expire(key, RATE_WINDOW)
-
-    return count > RATE_LIMIT
-
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(redis_listener())
     asyncio.create_task(presence_heartbeat())
-
-models.Base.metadata.create_all(bind=engine)
-
-# {username: [connection, connection, ...]}
-# one user can have multiple tabs/devices open
-connections: defaultdict[str, list[WebSocket]] = defaultdict(list)
-
-# {room_name: {username, username, ...}}
-rooms: defaultdict[str, set[str]] = defaultdict(set)
 
 
 @app.websocket("/ws")
@@ -165,32 +210,18 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
             elif data.startswith("/unread"):
                 # ---- unread count path ----
-                # data looks like: "/unread"  (all rooms this user is in)
+                # data looks like: "/unread"  (all rooms this user has joined)
                 db = SessionLocal()
                 try:
+                    my_rooms = (
+                        db.query(models.RoomMember.room)
+                        .filter(models.RoomMember.username == username)
+                        .all()
+                    )
+
                     lines = []
-                    for room_name in rooms:
-                        if username not in rooms[room_name]:
-                            continue
-
-                        record = (
-                            db.query(models.RoomRead)
-                            .filter(
-                                models.RoomRead.room == room_name,
-                                models.RoomRead.username == username,
-                            )
-                            .first()
-                        )
-                        last_read_id = record.last_read_id if record else 0
-
-                        count = (
-                            db.query(models.Message)
-                            .filter(
-                                models.Message.room == room_name,
-                                models.Message.id > last_read_id,
-                            )
-                            .count()
-                        )
+                    for (room_name,) in my_rooms:
+                        count = count_unread(db, room_name, username)
                         lines.append(f"{room_name}: {count} unread")
                 finally:
                     db.close()
@@ -211,11 +242,14 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     continue
 
                 room_name = parts[1]
-                rooms[room_name].add(username)
 
-                # open a short-lived session, same pattern as the write path
                 db = SessionLocal()
                 try:
+                    # a set used to prevent duplicates for free; now we check explicitly
+                    if not is_room_member(db, room_name, username):
+                        db.add(models.RoomMember(room=room_name, username=username))
+                        db.commit()
+
                     # newest 20 messages in this room
                     recent = (
                         db.query(models.Message)
@@ -224,6 +258,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         .limit(20)
                         .all()
                     )
+                    unread = count_unread(db, room_name, username)
+                    members = get_room_members(db, room_name)
                 finally:
                     db.close()
 
@@ -233,36 +269,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     for conn in connections[username]:
                         await conn.send_text(f"[{msg.room}] {msg.sender}: {msg.content}")
 
-                # how much did this user miss since their last read?
-                db = SessionLocal()
-                try:
-                    record = (
-                        db.query(models.RoomRead)
-                        .filter(
-                            models.RoomRead.room == room_name,
-                            models.RoomRead.username == username,
-                        )
-                        .first()
-                    )
-                    last_read_id = record.last_read_id if record else 0
-
-                    unread = (
-                        db.query(models.Message)
-                        .filter(
-                            models.Message.room == room_name,
-                            models.Message.id > last_read_id,
-                        )
-                        .count()
-                    )
-                finally:
-                    db.close()
-
                 if unread:
                     for conn in connections[username]:
                         await conn.send_text(f"[system] {unread} unread in {room_name}")
-                
+
                 # then announce the join to everyone in the room
-                for member in rooms[room_name]:
+                for member in members:
                     for conn in connections.get(member, []):
                         await conn.send_text(f"[system] {username} has joined {room_name}")
 
@@ -280,26 +292,32 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 room_name = parts[0][1:]
                 message = parts[1]
 
-                if room_name in rooms and username in rooms[room_name]:
-                    # persist first — delivery can fail, but the record should survive
-                    db = SessionLocal()
-                    try:
-                        db.add(models.Message(room=room_name, sender=username, content=message))
+                db = SessionLocal()
+                try:
+                    allowed = is_room_member(db, room_name, username)
+                    if allowed:
+                        # persist first — delivery can fail, but the record should survive
+                        db.add(models.Message(
+                            room=room_name,
+                            sender=username,
+                            content=message,
+                        ))
                         db.commit()
-                    finally:
-                        db.close()
+                finally:
+                    db.close()
 
-                    # publish instead of delivering directly — the listener fans out
-                    await redis_client.publish(ROOM_CHANNEL, json.dumps({
-                        "type": "room",
-                        "room": room_name,
-                        "sender": username,
-                        "content": message,
-                    }))
-                else:
-                    # user is not in the room or room doesn't exist
+                if not allowed:
                     for conn in connections[username]:
                         await conn.send_text(f"[system] You are not in {room_name}")
+                    continue
+
+                # publish instead of delivering directly — the listener fans out
+                await redis_client.publish(ROOM_CHANNEL, json.dumps({
+                    "type": "room",
+                    "room": room_name,
+                    "sender": username,
+                    "content": message,
+                }))
 
             elif data.startswith("@"):
                 # ---- DM path ----
@@ -323,15 +341,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         await conn.send_text(f"[system] {target} is not online")
                     continue
 
-                await redis_client.publish(
-                    ROOM_CHANNEL,
-                    json.dumps({
-                        "type": "dm",
-                        "target": target,
-                        "sender": username,
-                        "content": message,
-                    }),
-                )
+                await redis_client.publish(ROOM_CHANNEL, json.dumps({
+                    "type": "dm",
+                    "target": target,
+                    "sender": username,
+                    "content": message,
+                }))
 
             else:
                 # ---- broadcast path ----
