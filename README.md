@@ -22,6 +22,12 @@ Room messages and direct messages share a single channel and are distinguished b
 
 Each chat room stores its members in a `set`. Since sets ignore duplicate insertions in O(1) average time, users cannot join the same room multiple times, eliminating the need for additional duplicate-checking logic.
 
+### room membership
+
+Room membership was originally stored only in an in-memory set. This was simple and fast, but all membership information disappeared whenever the server restarted. Membership is now stored in PostgreSQL so it survives process restarts and can be shared across server instances.
+
+A separate cache was intentionally not added. PostgreSQL remains the single source of truth for membership, avoiding synchronization and cache invalidation problems. If membership lookups become a performance bottleneck, a cache can be introduced later as an optimization.
+
 ### presence
 
 When a server crashes, its disconnect handler never runs, leaving stale "online" records behind. Instead of relying on explicit deletion, each user is tracked by a Redis key with a 30-second TTL that a heartbeat refreshes every 10 seconds. If the heartbeat stops because the server crashed, Redis expires the key on its own, so no cleanup code has to run on a process that is already gone.
@@ -34,36 +40,57 @@ Room messages are written to PostgreSQL before they are delivered, so a record s
 
 Database sessions are opened per operation rather than per connection. A WebSocket connection can stay open for hours, so holding a session for its lifetime would exhaust the connection pool and keep transactions open unnecessarily.
 
+### direct messages
+
+Direct messages are stored using the same room model rather than a separate direct-message table. A DM conversation is represented as a room containing exactly two members.
+
+The room key is generated from the two usernames using `sorted`, so the same pair always produces the same key regardless of who initiates the conversation. For example, a message from `alice` to `bob` and a message from `bob` to `alice` both belong to the same conversation.
+
+This keeps direct messages compatible with the existing room message and Pub/Sub infrastructure without introducing a separate persistence path.
+
 ### read receipts
 
 Storing one read record per message and per user scales poorly. A room with 100 members and 1,000 messages would already require 100,000 rows. Instead, each (room, user) pair stores only `last_read_id`, the ID of the latest message that user has read. Unread counts are calculated by counting messages whose IDs are greater than `last_read_id`, so storage size stays independent of how many messages exist.
 
 This design assumes messages are read in order, so it cannot represent per-message read timestamps or skipped messages.
 
+### rate limiting
+
+Message sending is rate-limited using Redis `INCR`. Because `INCR` is atomic, concurrent requests can safely increment the counter without a read-modify-write race between server instances.
+
+The limiter uses a fixed time window, which means requests near a window boundary can theoretically pass through at up to roughly twice the configured limit. For example, messages sent at the end of one window and the beginning of the next are counted separately. A sliding-window or token-bucket limiter would provide stricter control, but the fixed-window approach is sufficient for preventing chat spam while keeping the implementation simple.
+
 ## Message protocol
 
-| Input | Action |
-|-------|--------|
-| `Hello` | Broadcast to all connected users |
-| `/join room` | Join a chat room, replay its recent history, and show unread count |
-| `#room message` | Send a message to everyone in a room |
-| `@user message` | Send a private message |
-| `/read room` | Mark a room as read up to its latest message |
-| `/unread` | Show unread counts for the rooms you have joined |
+| Input           | Action                                                             |
+| --------------- | ------------------------------------------------------------------ |
+| `Hello`         | Broadcast to all connected users                                   |
+| `/join room`    | Join a chat room, replay its recent history, and show unread count |
+| `#room message` | Send a message to everyone in a room                               |
+| `@user message` | Send a private message                                             |
+| `/dms user`     | Show recent direct-message history with a user                     |
+| `/read room`    | Mark a room as read up to its latest message                       |
+| `/unread`       | Show unread counts for the rooms you have joined                   |
 
 ## Input validation
 
 Originally, incomplete commands such as `@jason` or `#general` without a message caused an `IndexError`, terminating the WebSocket connection. Commands are now validated before parsing, and invalid input returns a usage message while keeping the connection alive.
 
+## Testing
+
+The application uses pytest to cover local request and response paths, including WebSocket behavior that can be exercised directly through the test client.
+
+Redis Pub/Sub paths are not fully covered by the automated tests. The background listener depends on asynchronous scheduling, and `TestClient` does not guarantee the same background listener lifecycle as a running server. These cross-instance delivery paths are therefore verified manually with multiple server instances.
+
 ## Tech stack
 
-| Component | Technology |
-|-----------|------------|
-| Backend | FastAPI |
-| Real-time communication | WebSocket |
-| Cross-instance messaging & presence | Redis |
-| Database | PostgreSQL |
-| Containers | Docker Compose |
+| Component                           | Technology     |
+| ----------------------------------- | -------------- |
+| Backend                             | FastAPI        |
+| Real-time communication             | WebSocket      |
+| Cross-instance messaging & presence | Redis          |
+| Database                            | PostgreSQL     |
+| Containers                          | Docker Compose |
 
 ## Running locally
 
@@ -104,7 +131,4 @@ uvicorn main:app --port 8001
 
 ## Current limitations
 
-- Room membership is still stored in memory, so joins are lost after a server restart even though messages persist.
-- Direct messages are not persisted.
-- Authentication is not implemented. Usernames are self-declared through a query parameter.
-- Automated tests have not yet been added.
+* Authentication is not implemented. Usernames are self-declared through a query parameter.
