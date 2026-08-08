@@ -1,6 +1,7 @@
 from collections import defaultdict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from database import engine, SessionLocal
+from fastapi.responses import FileResponse
 import models
 import asyncio
 import json
@@ -418,3 +419,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             del connections[username]
             # last connection gone -> go offline immediately instead of waiting for TTL
             await redis_client.delete(f"yap:online:{username}")
+
+@app.get("/")
+async def index():
+    return FileResponse("static/index.html")
