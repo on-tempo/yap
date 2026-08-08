@@ -2,6 +2,8 @@
 
 Yap is a real-time chat application built with FastAPI, WebSocket, Redis, and PostgreSQL.
 
+**Live demo:** yap-production-a52c.up.railway.app
+
 ## Why WebSocket
 
 Traditional polling forces a trade-off: polling frequently reduces message delay but increases unnecessary requests, while polling less often saves resources at the cost of slower message delivery. WebSocket keeps a persistent connection between the client and server, allowing the server to push new messages immediately. This removes the polling trade-off and enables low-latency communication with minimal overhead.
@@ -18,13 +20,9 @@ A single user can connect from multiple browser tabs or devices. Storing only on
 
 Room messages and direct messages share a single channel and are distinguished by a `type` field in the payload. Per-room or per-user channels would let each instance subscribe only to what it needs, but they add subscribe and unsubscribe bookkeeping on every join, connect, and disconnect.
 
-### rooms
-
-Each chat room stores its members in a `set`. Since sets ignore duplicate insertions in O(1) average time, users cannot join the same room multiple times, eliminating the need for additional duplicate-checking logic.
-
 ### room membership
 
-Room membership was originally stored only in an in-memory set. This was simple and fast, but all membership information disappeared whenever the server restarted. Membership is now stored in PostgreSQL so it survives process restarts and can be shared across server instances.
+Room membership was originally stored only in an in-memory set. This was simple and fast, and the set rejected duplicate joins for free, but all membership information disappeared whenever the server restarted. Membership is now stored in PostgreSQL so it survives process restarts and is shared across server instances; the duplicate check that the set provided implicitly is now an explicit query.
 
 A separate cache was intentionally not added. PostgreSQL remains the single source of truth for membership, avoiding synchronization and cache invalidation problems. If membership lookups become a performance bottleneck, a cache can be introduced later as an optimization.
 
@@ -62,15 +60,15 @@ The limiter uses a fixed time window, which means requests near a window boundar
 
 ## Message protocol
 
-| Input           | Action                                                             |
-| --------------- | ------------------------------------------------------------------ |
-| `Hello`         | Broadcast to all connected users                                   |
-| `/join room`    | Join a chat room, replay its recent history, and show unread count |
-| `#room message` | Send a message to everyone in a room                               |
-| `@user message` | Send a private message                                             |
-| `/dms user`     | Show recent direct-message history with a user                     |
-| `/read room`    | Mark a room as read up to its latest message                       |
-| `/unread`       | Show unread counts for the rooms you have joined                   |
+| Input | Action |
+|-------|--------|
+| `Hello` | Broadcast to all connected users |
+| `/join room` | Join a chat room, replay its recent history, and show unread count |
+| `#room message` | Send a message to everyone in a room |
+| `@user message` | Send a private message |
+| `/dms user` | Show recent direct-message history with a user |
+| `/read room` | Mark a room as read up to its latest message |
+| `/unread` | Show unread counts for the rooms you have joined |
 
 ## Input validation
 
@@ -82,15 +80,27 @@ The application uses pytest to cover local request and response paths, including
 
 Redis Pub/Sub paths are not fully covered by the automated tests. The background listener depends on asynchronous scheduling, and `TestClient` does not guarantee the same background listener lifecycle as a running server. These cross-instance delivery paths are therefore verified manually with multiple server instances.
 
+```bash
+pytest -v
+```
+
 ## Tech stack
 
-| Component                           | Technology     |
-| ----------------------------------- | -------------- |
-| Backend                             | FastAPI        |
-| Real-time communication             | WebSocket      |
-| Cross-instance messaging & presence | Redis          |
-| Database                            | PostgreSQL     |
-| Containers                          | Docker Compose |
+| Component | Technology |
+|-----------|------------|
+| Backend | FastAPI |
+| Real-time communication | WebSocket |
+| Frontend | React (loaded from CDN, no build step) |
+| Cross-instance messaging & presence | Redis |
+| Database | PostgreSQL |
+| Containers | Docker, Docker Compose |
+| Hosting | Railway |
+
+## Deployment
+
+The application is containerized with a single Dockerfile and deployed to Railway alongside managed PostgreSQL and Redis instances. Connection strings are injected as environment variables rather than hardcoded, so the same image runs locally and in production.
+
+The client picks its WebSocket scheme from the page it was served from (`wss://` over HTTPS, `ws://` otherwise) and connects to the same host, so no environment-specific configuration is needed on the frontend.
 
 ## Running locally
 
@@ -114,14 +124,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Open the browser developer tools and connect from the console:
-
-```javascript
-const ws = new WebSocket("ws://localhost:8000/ws?username=jason");
-ws.onmessage = (e) => console.log(e.data);
-ws.send("/join general");
-ws.send("#general hello");
-```
+Open http://localhost:8000, pick a username, and start chatting.
 
 To see cross-instance messaging, start a second server on another port and connect a second client to it:
 
@@ -131,4 +134,4 @@ uvicorn main:app --port 8001
 
 ## Current limitations
 
-* Authentication is not implemented. Usernames are self-declared through a query parameter.
+- Authentication is not implemented. Usernames are self-declared through a query parameter.
