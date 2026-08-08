@@ -48,6 +48,14 @@ def is_room_member(db, room_name: str, username: str) -> bool:
         is not None
     )
 
+def dm_room(user_a: str, user_b: str) -> str:
+    """Canonical room name for a DM pair.
+
+    Sorting makes the key identical regardless of who sends first,
+    so both directions land in the same conversation.
+    """
+    first, second = sorted([user_a, user_b])
+    return f"dm:{first}:{second}"
 
 def count_unread(db, room_name: str, username: str) -> int:
     """Messages in this room newer than the user's last read marker."""
@@ -278,6 +286,44 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     for conn in connections.get(member, []):
                         await conn.send_text(f"[system] {username} has joined {room_name}")
 
+            elif data.startswith("/dms"):
+                # ---- DM history path ----
+                # data looks like: "/dms bob"
+                parts = data.split(" ", 1)
+
+                if len(parts) < 2:
+                    for conn in connections[username]:
+                        await conn.send_text("[system] usage: /dms username")
+                    continue
+
+                target = parts[1]
+                room_name = dm_room(username, target)
+
+                db = SessionLocal()
+                try:
+                    # newest 20 messages in this conversation
+                    recent = (
+                        db.query(models.Message)
+                        .filter(models.Message.room == room_name)
+                        .order_by(models.Message.created_at.desc())
+                        .limit(20)
+                        .all()
+                    )
+                finally:
+                    db.close()
+
+                if not recent:
+                    for conn in connections[username]:
+                        await conn.send_text(f"[system] no messages with {target}")
+                    continue
+
+                # fetched newest-first, but display oldest-first
+                for msg in reversed(recent):
+                    for conn in connections[username]:
+                        await conn.send_text(
+                            f"[DM with {target}] {msg.sender}: {msg.content}"
+                        )
+
             elif data.startswith("#"):
                 # ---- room path ----
                 # data looks like: "#room1 hello everyone"
@@ -340,6 +386,18 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     for conn in connections[username]:
                         await conn.send_text(f"[system] {target} is not online")
                     continue
+
+                # persist the DM as a two-person room
+                db = SessionLocal()
+                try:
+                    db.add(models.Message(
+                        room=dm_room(username, target),
+                        sender=username,
+                        content=message,
+                    ))
+                    db.commit()
+                finally:
+                    db.close()
 
                 await redis_client.publish(ROOM_CHANNEL, json.dumps({
                     "type": "dm",
